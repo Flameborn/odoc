@@ -31,7 +31,7 @@ main :: proc() {
     }
     
     if target == "--version" || target == "-v" {
-        fmt.println("odindoc version 0.9.0")
+        fmt.println("odindoc version 0.1.0")
         return
     }
     
@@ -141,9 +141,16 @@ doc_package :: proc(path: string) {
     }
 
     // Extract package name from path
-    pkg_name := filepath.base(path)
+    pkg_name := path
     if strings.has_prefix(path, "core:") {
         pkg_name = strings.trim_prefix(path, "core:")
+    } else if path == "." {
+        // Get actual directory name for current directory
+        cwd := os.get_current_directory()
+        defer delete(cwd)
+        pkg_name = filepath.base(cwd)
+    } else {
+        pkg_name = filepath.base(path)
     }
     
     fmt.printf("package %s // import \"%s\"\n\n", pkg_name, path)
@@ -272,7 +279,15 @@ find_odin_files :: proc(path: string) -> ([dynamic]string, bool) {
     root_found := true
     
     actual_path := path
-    if !os.is_dir(path) {
+    
+    // Convert "." to absolute path
+    if path == "." {
+        cwd := os.get_current_directory()
+        defer delete(cwd)
+        actual_path = cwd
+    }
+    
+    if !os.is_dir(actual_path) {
         // Try as a core library reference
         if strings.has_prefix(path, "core:") {
             pkg := strings.trim_prefix(path, "core:")
@@ -406,57 +421,61 @@ parse_file :: proc(filepath: string, entries: ^[dynamic]Doc_Entry) {
     defer strings.builder_destroy(&doc_comment)
     
     is_private_marker := false
-    last_line_was_code := false
+    brace_depth := 0  // Track nesting level to know if we're inside a procedure/struct body
 
     for line, i in lines {
         trimmed := strings.trim_space(line)
         
+        // Store the depth at the start of this line
+        line_start_depth := brace_depth
+        
         // Check for @(private) attribute
         if strings.contains(trimmed, "@(private)") || strings.contains(trimmed, "@private") {
             is_private_marker = true
-            last_line_was_code = false
             continue
         }
         
-        // Collect documentation comments
+        // Collect documentation comments only at top level (brace_depth == 0)
         if strings.has_prefix(trimmed, "//") {
-            // If the last line was code (not a comment or empty), this is an inline/trailing comment
-            // Don't include it in doc comments
-            if last_line_was_code {
-                last_line_was_code = false
-                continue
+            // Only collect comments at the top level (outside any braces)
+            if line_start_depth == 0 {
+                comment := strings.trim_space(strings.trim_prefix(trimmed, "//"))
+                if strings.builder_len(doc_comment) > 0 {
+                    strings.write_string(&doc_comment, "\n")
+                }
+                strings.write_string(&doc_comment, "// ")
+                strings.write_string(&doc_comment, comment)
             }
-            
-            comment := strings.trim_space(strings.trim_prefix(trimmed, "//"))
-            if strings.builder_len(doc_comment) > 0 {
-                strings.write_string(&doc_comment, "\n")
+            // Track brace depth after processing
+            for c in trimmed {
+                if c == '{' do brace_depth += 1
+                else if c == '}' do brace_depth -= 1
             }
-            strings.write_string(&doc_comment, "// ")
-            strings.write_string(&doc_comment, comment)
-            last_line_was_code = false
             continue
         }
 
-        // Empty lines - preserve doc comments but reset code tracking
+        // Empty lines - preserve doc comments only at top level
         if trimmed == "" {
-            if strings.builder_len(doc_comment) > 0 {
+            if line_start_depth == 0 && strings.builder_len(doc_comment) > 0 {
                 strings.write_string(&doc_comment, "\n")
             }
-            last_line_was_code = false
+            // Track brace depth after processing
+            for c in trimmed {
+                if c == '{' do brace_depth += 1
+                else if c == '}' do brace_depth -= 1
+            }
             continue
         }
 
-        // Parse declarations
-        if strings.contains(trimmed, "::") {
+        // Parse declarations only at top level
+        if line_start_depth == 0 && strings.contains(trimmed, "::") {
             parts := strings.split(trimmed, "::")
             if len(parts) >= 2 {
                 name := strings.trim_space(parts[0])
                 rest := strings.trim_space(strings.join(parts[1:], "::"))
                 
-                // Check if name starts with underscore or lowercase (private by convention)
-                is_private := is_private_marker || 
-                              strings.has_prefix(name, "_") ||
-                              (len(name) > 0 && name[0] >= 'a' && name[0] <= 'z')
+                // Check if name starts with underscore (private by convention)
+                is_private := is_private_marker || strings.has_prefix(name, "_")
                 
                 // Strip proc body if it exists (everything from { onwards)
                 if brace_idx := strings.index_byte(rest, '{'); brace_idx >= 0 {
@@ -493,12 +512,16 @@ parse_file :: proc(filepath: string, entries: ^[dynamic]Doc_Entry) {
             // Reset doc comment and private marker after declaration
             strings.builder_reset(&doc_comment)
             is_private_marker = false
-            last_line_was_code = false
-        } else {
-            // Non-declaration line that's not a comment - reset doc comment and private marker
+        } else if line_start_depth == 0 {
+            // Non-declaration line at top level - reset doc comment
             strings.builder_reset(&doc_comment)
             is_private_marker = false
-            last_line_was_code = true
+        }
+        
+        // Track brace depth after processing
+        for c in trimmed {
+            if c == '{' do brace_depth += 1
+            else if c == '}' do brace_depth -= 1
         }
     }
 }
